@@ -107,6 +107,122 @@ Xavier determina soltanto i valori iniziali. Non sostituisce il training: durant
 
 Xavier è particolarmente adatta alle funzioni di attivazione simmetriche, come `tanh`. Con `ReLU` si usa spesso la **He initialization**, che tiene conto del fatto che ReLU annulla i valori negativi.
 
+## Perché non usare direttamente scalari per i caratteri
+
+Se vogliamo classificare una stringa, possiamo assegnare un ID intero a ogni carattere:
+
+```text
+a -> 1
+b -> 2
+c -> 3
+...
+```
+
+Questi ID sono utili come indici, ma non dovrebbero essere passati direttamente al Transformer come valori numerici. Lo scalare `20`, infatti, non contiene soltanto l'identità del carattere: introduce anche un ordine e una distanza tra i caratteri.
+
+Con una rappresentazione scalare, il modello può interpretare erroneamente che:
+
+```text
+distanza(a, b) < distanza(a, z)
+```
+
+perché, usando gli ID precedenti, `|1 - 2| < |1 - 26|`. Ma dal punto di vista linguistico non è detto che `a` sia più simile a `b` che a `z`. L'ordine numerico dipende solo dalla numerazione scelta: se scambiassimo gli ID, cambierebbero anche le distanze senza cambiare il significato dei caratteri.
+
+Il problema diventa evidente nelle proiezioni lineari del Transformer. Se `x` è uno scalare, una proiezione come:
+
+$$
+q = xW_q
+$$
+
+produce un vettore la cui ampiezza dipende direttamente dall'ID assegnato. Anche i punteggi dell'attenzione:
+
+$$
+score(q,k) = \frac{q \cdot k}{\sqrt{d_k}}
+$$
+
+dipenderebbero dai valori arbitrari degli ID. Il modello dovrebbe prima imparare a ignorare questo ordine artificiale, rendendo il training più difficile e la rappresentazione meno stabile.
+
+### ID come indice, embedding come input
+
+Usare gli ID non è sbagliato in assoluto. La distinzione importante è questa:
+
+```text
+ID intero -> indice in una tabella -> vettore embedding -> Transformer
+```
+
+La tabella di embedding contiene un vettore appreso per ogni carattere:
+
+```text
+'a' -> [ 0.12, -0.45,  0.77, ...]
+'b' -> [-0.31,  0.20,  0.11, ...]
+'z' -> [ 0.08,  0.91, -0.36, ...]
+```
+
+In questo caso gli ID servono soltanto per recuperare le righe della tabella. Il Transformer riceve i vettori, non i numeri `1`, `2` o `26`. Durante il training gli embedding vengono aggiornati insieme agli altri pesi, quindi il modello può imparare quali caratteri siano utili da considerare simili per il compito.
+
+Un'alternativa è il **one-hot encoding**, in cui ogni carattere è rappresentato da un vettore con un solo `1` e tutti gli altri valori uguali a zero. Il one-hot non introduce un ordine artificiale, ma ha dimensione pari al numero di caratteri e non contiene similarità apprese. Una matrice di embedding applicata a un vettore one-hot equivale, in pratica, a selezionare la riga corrispondente della tabella.
+
+Per una sequenza di caratteri il flusso corretto è quindi:
+
+```text
+caratteri -> ID interi -> character embedding -> positional encoding -> Transformer
+```
+
+### Come scegliere la dimensione degli embedding
+
+Non esiste una formula universale che stabilisca la dimensione ottimale di un embedding. La dimensione è un **iperparametro**: deve essere scelta in base al problema e verificata sperimentalmente.
+
+La dimensione dell'embedding non corrisponde al numero minimo di bit necessario per rappresentare l'ID. Se il vocabolario contiene 30 caratteri, bastano 5 bit per distinguere gli ID:
+
+$$
+\lceil \log_2(30) \rceil = 5
+$$
+
+Ma un embedding non è un codice binario. È un vettore di numeri reali appresi, usato per rappresentare proprietà utili al compito. Per questo 5 bit e 5 dimensioni di embedding sono concetti diversi, anche se 5 dimensioni possono comunque essere una scelta ragionevole per un problema piccolo.
+
+La procedura più affidabile è confrontare più dimensioni candidate mantenendo uguali dataset, architettura, learning rate ed epoche. Per esempio:
+
+```text
+dimensioni candidate: 4, 5, 8, 16
+```
+
+Per ogni candidata si addestra un modello e si misurano almeno:
+
+- loss e accuratezza sul training set;
+- loss e accuratezza su un validation set separato;
+- stabilità del risultato con più inizializzazioni casuali;
+- numero di parametri e tempo di addestramento.
+
+La validation è importante perché una dimensione grande può permettere al modello di memorizzare il training set senza imparare regole generalizzabili. I casi tipici sono:
+
+```text
+training loss alta, validation loss alta
+-> rappresentazione probabilmente troppo piccola o modello insufficiente
+
+training loss bassa, validation loss alta
+-> possibile overfitting, rappresentazione o modello troppo complessi
+
+training loss bassa, validation loss bassa
+-> buona capacità di apprendere e generalizzare
+```
+
+Per un vocabolario di circa 30 caratteri e un classificatore di parole semplice, si possono provare inizialmente dimensioni `5`, `8` e `16`. Se l'embedding è anche l'input del Transformer, spesso si imposta:
+
+```text
+embedding dimension = modelSize
+```
+
+così non serve una proiezione aggiuntiva. Per esempio, una configurazione didattica potrebbe essere:
+
+```text
+vocabolario: 30 caratteri
+embedding dimension: 5
+modelSize: 5
+feedForwardSize: 10
+```
+
+La scelta finale dovrebbe essere la dimensione più piccola che raggiunge buone prestazioni sul validation set in modo stabile. In questo modo si limita il numero di parametri senza sacrificare la capacità del modello.
+
 ## Concetti fondamentali del training
 
 ### Loss

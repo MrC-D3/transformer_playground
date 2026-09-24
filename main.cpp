@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -256,6 +258,67 @@ Matrix softmaxBackwardRows(const Matrix& probabilities, const Matrix& gradient) 
     return result;
 }
 
+class CharacterEmbedding {
+public:
+    CharacterEmbedding(std::size_t vocabularySize, std::size_t embeddingSize)
+        : vocabularySize_(vocabularySize),
+          embeddingSize_(embeddingSize),
+          generator_(44),
+          weights_(makeWeights(vocabularySize, embeddingSize, generator_)) {}
+
+    Matrix forward(const std::string& word) const {
+        Matrix result;
+        result.reserve(word.size());
+        for (unsigned char character : word) {
+            result.push_back(weights_[character]);
+        }
+        return result;
+    }
+
+    void backward(const std::string& word,
+                  const Matrix& gradient,
+                  double learningRate) {
+        Matrix gradients(vocabularySize_, std::vector<double>(embeddingSize_, 0.0));
+        for (std::size_t position = 0; position < word.size(); ++position) {
+            const unsigned char character = static_cast<unsigned char>(word[position]);
+            for (std::size_t dimension = 0; dimension < embeddingSize_; ++dimension) {
+                gradients[character][dimension] += gradient[position][dimension];
+            }
+        }
+
+        for (std::size_t character = 0; character < vocabularySize_; ++character) {
+            for (std::size_t dimension = 0; dimension < embeddingSize_; ++dimension) {
+                weights_[character][dimension] -=
+                    learningRate * gradients[character][dimension];
+            }
+        }
+    }
+
+    bool save(std::ostream& output) const {
+        output << "EMBEDDING\n";
+        writeMatrix(output, weights_);
+        return output.good();
+    }
+
+    bool load(std::istream& input) {
+        std::string section;
+        Matrix loadedWeights;
+        if (!(input >> section) || section != "EMBEDDING" ||
+            !readMatrix(input, loadedWeights) ||
+            !hasShape(loadedWeights, vocabularySize_, embeddingSize_)) {
+            return false;
+        }
+        weights_ = loadedWeights;
+        return true;
+    }
+
+private:
+    std::size_t vocabularySize_;
+    std::size_t embeddingSize_;
+    std::mt19937 generator_;
+    Matrix weights_;
+};
+
 struct EncoderCache {
     Matrix input;
     Matrix query;
@@ -319,7 +382,7 @@ public:
         return cache.output;
     }
 
-    void backward(const EncoderCache& cache, const Matrix& gradient, double learningRate) {
+    Matrix backward(const EncoderCache& cache, const Matrix& gradient, double learningRate) {
         std::vector<double> gradientGammaOutput(modelSize_, 0.0);
         std::vector<double> gradientBetaOutput(modelSize_, 0.0);
         accumulateLayerNormGradients(cache.outputNormalized, gradient,
@@ -372,6 +435,8 @@ public:
         subtractScaled(betaOutput_, gradientBetaOutput, learningRate);
         subtractScaled(gammaAttention_, gradientGammaAttention, learningRate);
         subtractScaled(betaAttention_, gradientBetaAttention, learningRate);
+
+        return gradientInput;
     }
 
     bool save(std::ostream& output) const {
@@ -514,15 +579,14 @@ public:
           weights_(makeWeights(inputSize, numberOfClasses, generator_)),
           biases_(numberOfClasses, 0.0) {}
 
-    double train(Encoder& encoder,
-                 const Matrix& encoded,
-                 const EncoderCache& encoderCache,
+    Matrix train(const Matrix& encoded,
                  std::size_t target,
-                 double learningRate) {
+                 double learningRate,
+                 double& loss) {
         std::vector<double> features = meanRows(encoded);
         std::vector<double> logits = predictLogits(features);
         std::vector<double> probabilities = softmax(logits);
-        double loss = -std::log(std::max(probabilities[target], 1e-12));
+        loss = -std::log(std::max(probabilities[target], 1e-12));
         std::vector<double> gradientFeatures(features.size(), 0.0);
 
         for (std::size_t classIndex = 0; classIndex < biases_.size(); ++classIndex) {
@@ -544,8 +608,12 @@ public:
                                static_cast<double>(encoded.size());
             }
         }
-        encoder.backward(encoderCache, gradientEncoded, learningRate);
-        return loss;
+        return gradientEncoded;
+    }
+
+    double crossEntropyLoss(const Matrix& encoded, std::size_t target) const {
+        std::vector<double> probabilities = softmax(predictLogits(meanRows(encoded)));
+        return -std::log(std::max(probabilities[target], 1e-12));
     }
 
     std::size_t predict(const Matrix& encoded) const {
@@ -608,13 +676,19 @@ void printMatrix(const Matrix& matrix) {
 }
 
 struct Sample {
-    Matrix tokens;
+    std::string word;
     std::size_t label;
 };
 
-bool loadDataset(const std::string& path,
-                 std::vector<Sample>& dataset,
-                 std::size_t expectedFeatures) {
+struct ModelMetadata {
+    std::size_t completedEpochs = 0;
+    std::size_t bestEpoch = 0;
+    double trainingLoss = 0.0;
+    double validationLoss = 0.0;
+    bool hasValidationLoss = false;
+};
+
+bool loadDatasetFile(const std::string& path, std::vector<Sample>& dataset) {
     std::ifstream input(path);
     if (!input) {
         return false;
@@ -625,126 +699,439 @@ bool loadDataset(const std::string& path,
         return false;
     }
 
-    dataset.clear();
-    dataset.reserve(sampleCount);
+    dataset.reserve(dataset.size() + sampleCount);
     for (std::size_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
         std::size_t label = 0;
-        std::size_t tokenCount = 0;
-        std::size_t featureCount = 0;
-        if (!(input >> label >> tokenCount >> featureCount) ||
-            tokenCount == 0 || featureCount != expectedFeatures) {
+        std::string word;
+        if (!(input >> label >> word) || word.empty() || label > 1) {
             return false;
         }
 
-        Matrix tokens(tokenCount, std::vector<double>(featureCount));
-        for (std::vector<double>& token : tokens) {
-            for (double& feature : token) {
-                if (!(input >> feature)) {
-                    return false;
-                }
+        for (unsigned char character : word) {
+            if (character >= 128) {
+                return false;
             }
         }
-        dataset.push_back({tokens, label});
+        dataset.push_back({word, label});
     }
     return true;
 }
 
-void evaluate(Encoder& encoder,
+void evaluate(CharacterEmbedding& embedding,
+              Encoder& encoder,
               const LinearClassifier& classifier,
               const std::vector<Sample>& dataset) {
     std::size_t correct = 0;
     for (const Sample& sample : dataset) {
         EncoderCache cache;
-        Matrix encoded = encoder.forward(positionalEncoding(sample.tokens), cache);
+        Matrix embedded = embedding.forward(sample.word);
+        Matrix encoded = encoder.forward(positionalEncoding(embedded), cache);
         std::size_t prediction = classifier.predict(encoded);
         correct += prediction == sample.label ? 1 : 0;
-        std::cout << "Target: " << sample.label << ", predizione: " << prediction << '\n';
+        std::cout << "Parola: " << sample.word
+                  << ", target: " << sample.label
+                  << ", predizione: " << prediction << '\n';
     }
     std::cout << "Accuratezza: " << correct << "/" << dataset.size() << '\n';
 }
 
+double evaluateLoss(const CharacterEmbedding& embedding,
+                    const Encoder& encoder,
+                    const LinearClassifier& classifier,
+                    const std::vector<Sample>& dataset) {
+    double totalLoss = 0.0;
+    for (const Sample& sample : dataset) {
+        EncoderCache cache;
+        Matrix embedded = embedding.forward(sample.word);
+        Matrix encoded = encoder.forward(positionalEncoding(embedded), cache);
+        totalLoss += classifier.crossEntropyLoss(encoded, sample.label);
+    }
+    return totalLoss / static_cast<double>(dataset.size());
+}
+
+void writeMetadata(std::ostream& output, const ModelMetadata& metadata) {
+    output << "METADATA\n"
+           << metadata.completedEpochs << ' '
+           << metadata.bestEpoch << ' '
+           << std::setprecision(17) << metadata.trainingLoss << ' '
+           << metadata.validationLoss << ' '
+           << (metadata.hasValidationLoss ? 1 : 0) << '\n';
+}
+
+bool readMetadata(std::istream& input, ModelMetadata& metadata) {
+    std::string section;
+    int hasValidationLoss = 0;
+    if (!(input >> section) || section != "METADATA" ||
+        !(input >> metadata.completedEpochs >> metadata.bestEpoch >>
+          metadata.trainingLoss >> metadata.validationLoss >> hasValidationLoss) ||
+        (hasValidationLoss != 0 && hasValidationLoss != 1)) {
+        return false;
+    }
+    metadata.hasValidationLoss = hasValidationLoss == 1;
+    return true;
+}
+
 bool saveModel(const std::string& path,
+               const CharacterEmbedding& embedding,
                const Encoder& encoder,
-               const LinearClassifier& classifier) {
+               const LinearClassifier& classifier,
+               const ModelMetadata& metadata) {
     std::ofstream output(path);
     if (!output) {
         return false;
     }
-    output << "MINI_TRANSFORMER_ENCODER_V1\n";
-    return encoder.save(output) && classifier.save(output);
+    output << "MINI_TRANSFORMER_CHAR_ENCODER_V3\n";
+    writeMetadata(output, metadata);
+    return embedding.save(output) && encoder.save(output) && classifier.save(output);
 }
 
 bool loadModel(const std::string& path,
+               CharacterEmbedding& embedding,
                Encoder& encoder,
-               LinearClassifier& classifier) {
+               LinearClassifier& classifier,
+               ModelMetadata& metadata) {
     std::ifstream input(path);
     if (!input) {
         return false;
     }
 
     std::string signature;
-    if (!(input >> signature) || signature != "MINI_TRANSFORMER_ENCODER_V1") {
+    if (!(input >> signature) ||
+        (signature != "MINI_TRANSFORMER_CHAR_ENCODER_V3" &&
+         signature != "MINI_TRANSFORMER_CHAR_ENCODER_V2")) {
         return false;
     }
-    return encoder.load(input) && classifier.load(input);
+    metadata = ModelMetadata{};
+    if (signature == "MINI_TRANSFORMER_CHAR_ENCODER_V3" &&
+        !readMetadata(input, metadata)) {
+        return false;
+    }
+    return embedding.load(input) && encoder.load(input) && classifier.load(input);
 }
 
 void printUsage(const char* programName) {
     std::cout << "Uso:\n"
-              << "  " << programName << " train    Addestra e salva il modello\n"
-              << "  " << programName << " predict  Carica il modello e classifica il dataset\n";
+              << "  " << programName
+              << " train [dataset1 dataset2 ...] [--validation file]\n"
+              << "        [--epochs N] [--patience N] [--loss-threshold X] [--resume]\n"
+              << "                                                    Addestra e salva il modello\n"
+              << "  " << programName
+              << " predict [dataset]                Carica il modello e classifica il dataset\n";
+}
+
+bool parsePositiveSize(const std::string& text, std::size_t& value) {
+    try {
+        std::size_t charactersRead = 0;
+        unsigned long long parsed = std::stoull(text, &charactersRead);
+        if (charactersRead != text.size() || parsed == 0 ||
+            parsed > std::numeric_limits<std::size_t>::max()) {
+            return false;
+        }
+        value = static_cast<std::size_t>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool parseNonNegativeDouble(const std::string& text, double& value) {
+    try {
+        std::size_t charactersRead = 0;
+        double parsed = std::stod(text, &charactersRead);
+        if (charactersRead != text.size() || !std::isfinite(parsed) || parsed < 0.0) {
+            return false;
+        }
+        value = parsed;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 2 || (std::string(argv[1]) != "train" &&
-                      std::string(argv[1]) != "predict")) {
+    if (argc < 2 || (std::string(argv[1]) != "train" &&
+                     std::string(argv[1]) != "predict")) {
         printUsage(argv[0]);
         return 1;
     }
 
     const std::string mode = argv[1];
-    const std::string modelPath = "transformer_model.txt";
-    const std::string datasetPath = mode == "train" ? "train_data.txt" : "test_data.txt";
-    std::vector<Sample> dataset;
-    if (!loadDataset(datasetPath, dataset, 4)) {
-        std::cerr << "Errore: impossibile leggere " << datasetPath
-                  << ". Controllare il formato del dataset.\n";
-        return 1;
+    const std::string bestModelPath = "transformer_model.txt";
+    const std::string latestModelPath = "transformer_model_latest.txt";
+    const std::size_t defaultEpochs = 1000;
+    std::size_t epochs = defaultEpochs;
+    const std::size_t defaultPatience = 5;
+    std::size_t patience = defaultPatience;
+    double lossThreshold = 0.0;
+    bool hasLossThreshold = false;
+    bool resume = false;
+    std::vector<std::string> datasetPaths;
+    std::vector<std::string> validationPaths;
+
+    if (mode == "train") {
+        for (int argument = 2; argument < argc; ++argument) {
+            const std::string currentArgument = argv[argument];
+            if (currentArgument == "--epochs") {
+                if (argument + 1 >= argc ||
+                    !parsePositiveSize(argv[argument + 1], epochs)) {
+                    std::cerr << "Errore: --epochs richiede un intero positivo.\n";
+                    return 1;
+                }
+                ++argument;
+            } else if (currentArgument == "--loss-threshold") {
+                if (argument + 1 >= argc ||
+                    !parseNonNegativeDouble(argv[argument + 1], lossThreshold)) {
+                    std::cerr << "Errore: --loss-threshold richiede un numero maggiore o uguale a zero.\n";
+                    return 1;
+                }
+                hasLossThreshold = true;
+                ++argument;
+            } else if (currentArgument == "--patience") {
+                if (argument + 1 >= argc ||
+                    !parsePositiveSize(argv[argument + 1], patience)) {
+                    std::cerr << "Errore: --patience richiede un intero positivo.\n";
+                    return 1;
+                }
+                ++argument;
+            } else if (currentArgument == "--validation") {
+                if (argument + 1 >= argc ||
+                    std::string(argv[argument + 1]).rfind("--", 0) == 0) {
+                    std::cerr << "Errore: --validation richiede il percorso di un dataset.\n";
+                    return 1;
+                }
+                validationPaths.push_back(argv[argument + 1]);
+                ++argument;
+            } else if (currentArgument == "--resume") {
+                resume = true;
+            } else {
+                if (currentArgument.rfind("--", 0) == 0) {
+                    std::cerr << "Errore: opzione non riconosciuta: "
+                              << currentArgument << '\n';
+                    return 1;
+                }
+                datasetPaths.push_back(currentArgument);
+            }
+        }
+        if (datasetPaths.empty()) {
+            datasetPaths.push_back("datasets/train_data.txt");
+        }
+    } else {
+        if (resume) {
+            std::cerr << "Errore: --resume è disponibile solo con train.\n";
+            return 1;
+        }
+        if (argc == 2) {
+            datasetPaths.push_back("datasets/test_data.txt");
+        } else if (argc == 3 && std::string(argv[2]).rfind("--", 0) != 0) {
+            datasetPaths.push_back(argv[2]);
+        } else {
+            printUsage(argv[0]);
+            return 1;
+        }
     }
 
-    Encoder encoder(4, 8);
-    LinearClassifier classifier(4, 2);
+    std::vector<Sample> dataset;
+    for (const std::string& datasetPath : datasetPaths) {
+        std::vector<Sample> fileDataset;
+        if (!loadDatasetFile(datasetPath, fileDataset)) {
+            std::cerr << "Errore: impossibile leggere " << datasetPath
+                      << ". Controllare il formato del dataset.\n";
+            return 1;
+        }
+        dataset.insert(dataset.end(), fileDataset.begin(), fileDataset.end());
+    }
+
+    std::vector<Sample> validationDataset;
+    for (const std::string& validationPath : validationPaths) {
+        std::vector<Sample> fileDataset;
+        if (!loadDatasetFile(validationPath, fileDataset)) {
+            std::cerr << "Errore: impossibile leggere il dataset di validation "
+                      << validationPath << ". Controllare il formato del dataset.\n";
+            return 1;
+        }
+        validationDataset.insert(
+            validationDataset.end(), fileDataset.begin(), fileDataset.end());
+    }
+
+    constexpr std::size_t asciiVocabularySize = 128;
+    constexpr std::size_t embeddingSize = 10;
+    constexpr std::size_t feedForwardSize = 20;
+
+    CharacterEmbedding embedding(asciiVocabularySize, embeddingSize);
+    Encoder encoder(embeddingSize, feedForwardSize);
+    LinearClassifier classifier(embeddingSize, 2);
+    ModelMetadata latestMetadata;
+
+    if (resume && !loadModel(
+            latestModelPath, embedding, encoder, classifier, latestMetadata)) {
+        std::cerr << "Errore: impossibile caricare " << latestModelPath
+                  << " per continuare il training. Eseguire prima una run senza --resume.\n";
+        return 1;
+    }
 
     if (mode == "train") {
         const double learningRate = 0.01;
-        const std::size_t epochs = 1000;
+        const bool hasValidation = !validationDataset.empty();
+        double bestValidationLoss = std::numeric_limits<double>::infinity();
+        std::size_t epochsWithoutImprovement = 0;
+        std::size_t bestEpoch = 0;
+        bool bestModelIsFromPreviousRun = false;
+        const std::size_t startingEpoch = resume ? latestMetadata.completedEpochs : 0;
+        CharacterEmbedding bestEmbedding = embedding;
+        Encoder bestEncoder = encoder;
+        LinearClassifier bestClassifier = classifier;
+        ModelMetadata bestMetadata;
+
+        if (hasValidation && resume) {
+            ModelMetadata loadedBestMetadata;
+            if (loadModel(bestModelPath, bestEmbedding, bestEncoder,
+                          bestClassifier, loadedBestMetadata)) {
+                bestMetadata = loadedBestMetadata;
+                if (loadedBestMetadata.hasValidationLoss) {
+                    bestValidationLoss = loadedBestMetadata.validationLoss;
+                } else {
+                    bestValidationLoss = evaluateLoss(
+                        bestEmbedding, bestEncoder, bestClassifier, validationDataset);
+                    bestMetadata.validationLoss = bestValidationLoss;
+                    bestMetadata.hasValidationLoss = true;
+                }
+                bestEpoch = loadedBestMetadata.bestEpoch;
+                bestModelIsFromPreviousRun = true;
+            }
+        }
 
         for (std::size_t epoch = 0; epoch < epochs; ++epoch) {
+            const std::size_t globalEpoch = startingEpoch + epoch + 1;
+            const auto epochStart = std::chrono::steady_clock::now();
+            std::cout << "Inizio Epoca #" << globalEpoch << "." << std::endl;
             double totalLoss = 0.0;
             for (const Sample& sample : dataset) {
                 EncoderCache cache;
-                Matrix encoded = encoder.forward(positionalEncoding(sample.tokens), cache);
-                totalLoss += classifier.train(encoder, encoded, cache,
-                                              sample.label, learningRate);
+                Matrix embedded = embedding.forward(sample.word);
+                Matrix encoded = encoder.forward(positionalEncoding(embedded), cache);
+
+                double loss = 0.0;
+                Matrix gradientEncoded = classifier.train(
+                    encoded, sample.label, learningRate, loss);
+                Matrix gradientInput = encoder.backward(cache, gradientEncoded, learningRate);
+                embedding.backward(sample.word, gradientInput, learningRate);
+                totalLoss += loss;
             }
-            if (epoch % 200 == 0 || epoch == epochs - 1) {
-                std::cout << "Epoca " << epoch + 1
-                          << ", loss: " << totalLoss / dataset.size() << '\n';
+            const double averageLoss = totalLoss / dataset.size();
+            double validationLoss = 0.0;
+            if (hasValidation) {
+                validationLoss = evaluateLoss(
+                    embedding, encoder, classifier, validationDataset);
+                if (validationLoss < bestValidationLoss) {
+                    bestValidationLoss = validationLoss;
+                    epochsWithoutImprovement = 0;
+                    bestEpoch = globalEpoch;
+                    bestModelIsFromPreviousRun = false;
+                    bestEmbedding = embedding;
+                    bestEncoder = encoder;
+                    bestClassifier = classifier;
+                    bestMetadata.completedEpochs = globalEpoch;
+                    bestMetadata.bestEpoch = globalEpoch;
+                    bestMetadata.trainingLoss = averageLoss;
+                    bestMetadata.validationLoss = validationLoss;
+                    bestMetadata.hasValidationLoss = true;
+                    if (!saveModel(bestModelPath, embedding, encoder,
+                                   classifier, bestMetadata)) {
+                        std::cerr << "Errore: impossibile salvare il modello migliore in "
+                                  << bestModelPath << '\n';
+                        return 1;
+                    }
+                } else {
+                    ++epochsWithoutImprovement;
+                }
+            }
+            const auto epochEnd = std::chrono::steady_clock::now();
+            const auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+                epochEnd - epochStart).count();
+            const auto minutes = elapsedSeconds / 60;
+            const auto seconds = elapsedSeconds % 60;
+            std::cout << "Fine Epoca #" << globalEpoch
+                      << ". Tempo impiegato "
+                      << std::setfill('0') << std::setw(2) << minutes << ':'
+                      << std::setw(2) << seconds << std::setfill(' ')
+                      << ". Training loss: " << averageLoss;
+            if (hasValidation) {
+                std::cout << ", Validation loss: " << validationLoss;
+            }
+            std::cout << '\n';
+            if (!hasValidation) {
+                bestMetadata.completedEpochs = globalEpoch;
+                bestMetadata.bestEpoch = globalEpoch;
+                bestMetadata.trainingLoss = averageLoss;
+                bestMetadata.validationLoss = 0.0;
+                bestMetadata.hasValidationLoss = false;
+            }
+            ModelMetadata currentMetadata;
+            currentMetadata.completedEpochs = globalEpoch;
+            currentMetadata.bestEpoch = bestMetadata.bestEpoch;
+            currentMetadata.trainingLoss = averageLoss;
+            currentMetadata.validationLoss = validationLoss;
+            currentMetadata.hasValidationLoss = hasValidation;
+            if (!saveModel(latestModelPath, embedding, encoder, classifier,
+                           currentMetadata)) {
+                std::cerr << "Errore: impossibile salvare l'ultimo modello in "
+                          << latestModelPath << '\n';
+                return 1;
+            }
+            if (!hasValidation &&
+                !saveModel(bestModelPath, embedding, encoder, classifier,
+                           bestMetadata)) {
+                std::cerr << "Errore: impossibile salvare il modello in "
+                          << bestModelPath << '\n';
+                return 1;
+            }
+            if (hasLossThreshold && averageLoss < lossThreshold) {
+                std::cout << "Arresto anticipato: training loss " << averageLoss
+                          << " inferiore alla soglia " << lossThreshold << ".\n";
+                break;
+            }
+            if (hasValidation && epochsWithoutImprovement >= patience) {
+                std::cout << "Arresto anticipato: la validation loss non migliora da "
+                          << patience << " epoche.\n";
+                break;
             }
         }
 
-        if (!saveModel(modelPath, encoder, classifier)) {
-            std::cerr << "Errore: impossibile salvare il modello in " << modelPath << '\n';
+        if (hasValidation) {
+            embedding = bestEmbedding;
+            encoder = bestEncoder;
+            classifier = bestClassifier;
+            if (!saveModel(bestModelPath, embedding, encoder, classifier,
+                           bestMetadata)) {
+                std::cerr << "Errore: impossibile salvare il modello migliore in "
+                          << bestModelPath << '\n';
+                return 1;
+            }
+            if (bestModelIsFromPreviousRun) {
+                std::cout << "Ripristinati i pesi del modello migliore precedente"
+                          << ", validation loss: " << bestValidationLoss << ".\n";
+            } else {
+                std::cout << "Ripristinati i pesi dell'epoca migliore: " << bestEpoch
+                          << ", validation loss: " << bestValidationLoss << ".\n";
+            }
+        }
+
+        if (!hasValidation &&
+            !saveModel(bestModelPath, embedding, encoder, classifier,
+                       bestMetadata)) {
+            std::cerr << "Errore: impossibile salvare il modello in " << bestModelPath << '\n';
             return 1;
         }
-        std::cout << "Modello salvato in " << modelPath << '\n';
+        std::cout << "Modello migliore salvato in " << bestModelPath << '\n';
+        std::cout << "Ultimo modello salvato in " << latestModelPath << '\n';
         return 0;
     }
 
-    if (!loadModel(modelPath, encoder, classifier)) {
-        std::cerr << "Errore: impossibile caricare " << modelPath
+    ModelMetadata modelMetadata;
+    if (!loadModel(bestModelPath, embedding, encoder, classifier, modelMetadata)) {
+        std::cerr << "Errore: impossibile caricare " << bestModelPath
                   << ". Eseguire prima: " << argv[0] << " train\n";
         return 1;
     }
-    evaluate(encoder, classifier, dataset);
+    evaluate(embedding, encoder, classifier, dataset);
 }

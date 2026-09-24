@@ -46,25 +46,25 @@ gli esempi nell'ordine indicato:
 .\transformer_encoder.exe train datasets/morphit_ascii_data.txt datasets/morphit_ascii_negative_data.txt
 ```
 
-Se non vengono indicati file, viene usato `datasets/train_data.txt`.
+Se non vengono indicati file, viene usato `datasets/training_set.txt`.
 Il numero di epoche predefinito è `1000`, ma si può modificare:
 
 ```powershell
-.\transformer_encoder.exe train datasets/morphit_ascii_data.txt datasets/morphit_ascii_negative_data.txt --epochs 3
+.\transformer_encoder.exe train datasets/training_set.txt --epochs 3
 ```
 
 È possibile interrompere automaticamente il training quando la loss media
 dell'epoca scende sotto una soglia:
 
 ```powershell
-.\transformer_encoder.exe train datasets/morphit_ascii_data.txt datasets/morphit_ascii_negative_data.txt --epochs 100 --loss-threshold 0.01
+.\transformer_encoder.exe train datasets/training_set.txt --epochs 100 --loss-threshold 0.01
 ```
 
 Per usare una validation loss e fermare il training dopo `5` epoche senza
 miglioramenti:
 
 ```powershell
-.\transformer_encoder.exe train datasets/morphit_ascii_data.txt datasets/morphit_ascii_negative_data.txt --validation datasets/test_data.txt --epochs 100 --patience 5
+.\transformer_encoder.exe train datasets/training_set.txt --validation datasets/validation_set.txt --epochs 100 --patience 5
 ```
 
 L'opzione `--validation` può essere ripetuta per concatenare più file di
@@ -72,25 +72,36 @@ validation. Dopo ogni epoca il programma calcola la validation loss senza
 aggiornare i pesi, salva in memoria i pesi migliori e ripristina quelli alla
 fine del training.
 
+Per uno smoke test si può limitare il numero di esempi letti da ogni file:
+
+```powershell
+.\transformer_encoder.exe train --limit 10 --validation datasets/validation_set.txt --epochs 2 --patience 1
+```
+
+Il programma stamperà il numero effettivo di esempi caricati. `--limit 10`
+legge i primi 10 esempi di ciascun file, senza creare dataset temporanei. La
+loss e l'accuratezza ottenute in questo modo servono solo a verificare che il
+codice funzioni, non a valutare la qualità del modello.
+
 Per continuare un training precedente dall'ultima epoca completata:
 
 ```powershell
-.\transformer_encoder.exe train last_training_set.txt --validation last_validation_set.txt --epochs 1 --patience 5 --resume
+.\transformer_encoder.exe train datasets/training_set.txt --validation datasets/validation_set.txt --epochs 1 --patience 5 --resume
 ```
 
-`--resume` carica `transformer_model_latest.txt`. Al termine di ogni epoca il
-programma salva sempre quel checkpoint; `transformer_model.txt` contiene invece
+`--resume` carica `models/transformer_model_latest.txt`. Al termine di ogni epoca il
+programma salva sempre quel checkpoint; `models/transformer_model.txt` contiene invece
 il modello con la validation loss migliore. I checkpoint includono anche
 metadati: epoca completata, epoca migliore, training loss e validation loss.
 
 Il programma stampa l'inizio e la fine di ogni epoca, il tempo impiegato e la
-loss. Alla fine salva il modello in `transformer_model.txt`:
+loss. Alla fine salva il modello in `models/transformer_model.txt`:
 
 ```text
 Inizio Epoca #1.
 Fine Epoca #1. Tempo impiegato 00:42. Training loss: ...
 ...
-Modello salvato in transformer_model.txt
+Modello migliore salvato in models/transformer_model.txt
 ```
 
 ### Predict
@@ -101,7 +112,7 @@ Dopo aver eseguito il training, per usare il modello senza riaddestrarlo:
 .\transformer_encoder.exe predict
 ```
 
-La modalità `predict` carica `transformer_model.txt`, esegue soltanto il forward pass e stampa le predizioni:
+La modalità `predict` carica `models/transformer_model.txt`, esegue soltanto il forward pass e stampa le predizioni:
 
 ```text
 Target: 0, predizione: 0
@@ -121,7 +132,7 @@ Le modalità sono indipendenti e usano file diversi:
    modello; se viene indicata una validation, usa anche `--patience` per
    l'early stopping. Con `--resume` carica l'ultimo checkpoint invece di
    inizializzare pesi nuovi;
-2. `predict` legge `transformer_model.txt` e `datasets/test_data.txt`, crea le rappresentazioni con il forward pass e classifica gli esempi.
+2. `predict` legge `models/transformer_model.txt` e `datasets/test_set.txt`, crea le rappresentazioni con il forward pass e classifica gli esempi.
 
 Il comando:
 
@@ -137,17 +148,19 @@ non esegue predizioni alla fine del training. Per classificarli bisogna eseguire
 
 Ogni nuova esecuzione di `train` riparte da pesi iniziali nuovi, a meno che non
 si specifichi `--resume`. Il training salva l'ultima epoca in
-`transformer_model_latest.txt` e il miglior modello secondo la validation loss
-in `transformer_model.txt`. Una nuova esecuzione di `predict`, invece, carica
-`transformer_model.txt` e non modifica i pesi.
+`models/transformer_model_latest.txt` e il miglior modello secondo la
+validation loss in `models/transformer_model.txt`. Una nuova esecuzione di
+`predict`, invece, carica `models/transformer_model.txt` e non modifica i
+pesi.
 
-Se si esegue `predict` prima di `train`, il programma mostra un errore perché `transformer_model.txt` non esiste ancora. Il dataset di test è separato da quello di training, quindi l'accuratezza misura il comportamento su esempi non usati per aggiornare i pesi.
+Se si esegue `predict` prima di `train`, il programma mostra un errore perché `models/transformer_model.txt` non esiste ancora. Il dataset di test è separato da quello di training, quindi l'accuratezza misura il comportamento su esempi non usati per aggiornare i pesi.
 
 I comandi disponibili sono:
 
 ```text
-programma train [dataset1 dataset2 ...] [--epochs N] [--loss-threshold X]
-programma predict [dataset]
+programma train [dataset1 dataset2 ...] [--validation file] [--epochs N]
+                 [--patience N] [--loss-threshold X] [--limit N] [--resume]
+programma predict [dataset] [--limit N]
 ```
 
 Il file dei pesi è testuale e contiene la tabella degli embedding ASCII,
@@ -155,7 +168,8 @@ matrici, vettori `gamma`/`beta`, bias e parametri del classificatore.
 
 ## Formato dei dataset
 
-I file `datasets/train_data.txt` e `datasets/test_data.txt` usano lo stesso formato testuale. La
+I file `datasets/training_set.txt`, `datasets/validation_set.txt` e
+`datasets/test_set.txt` usano lo stesso formato testuale. La
 prima riga contiene il numero di esempi. Ogni esempio è composto da label e
 parola:
 
@@ -176,8 +190,8 @@ label `0` indica una parola inventata. Il programma accetta caratteri ASCII e
 può gestire parole di lunghezza diversa. Non vengono usati padding o batch: un
 esempio alla volta viene convertito in una matrice `lunghezza_parola × 10`.
 
-Per aggiungere esempi di training, modificare `datasets/train_data.txt`. Per aggiungere
-esempi di valutazione, modificare `datasets/test_data.txt`. Le label devono essere `0` o
+Per aggiungere esempi di training, modificare il dataset appropriato in
+`datasets/`. Le label devono essere `0` o
 `1` e le parole devono contenere soltanto caratteri ASCII.
 
 ### Dataset pulito da Morph-it!
@@ -226,16 +240,16 @@ Per creare direttamente i tre dataset bilanciati, con divisione `80% / 10% /
 ```powershell
 python3 tools/generate_morphit_dataset.py \
   /percorso/morph-it_048.txt \
-  --split-training-output last_training_set.txt \
-  --split-validation-output last_validation_set.txt \
-  --split-test-output last_test_set.txt
+  --split-training-output datasets/training_set.txt \
+  --split-validation-output datasets/validation_set.txt \
+  --split-test-output datasets/test_set.txt
 ```
 
 I tre file risultanti contengono rispettivamente:
 
-- `last_training_set.txt`: 612.032 esempi, metà positivi e metà negativi;
-- `last_validation_set.txt`: 76.504 esempi, metà positivi e metà negativi;
-- `last_test_set.txt`: 76.504 esempi, metà positivi e metà negativi.
+- `training_set.txt`: 612.032 esempi, metà positivi e metà negativi;
+- `validation_set.txt`: 76.504 esempi, metà positivi e metà negativi;
+- `test_set.txt`: 76.504 esempi, metà positivi e metà negativi.
 
 Le parole positive e negative vengono prima abbinate, poi le coppie vengono
 mescolate e distribuite nei tre file. In questo modo ogni split conserva lo
@@ -346,13 +360,12 @@ validation loss.
 
 - `main.cpp`: implementazione degli embedding ASCII, dell'encoder, del backward pass, del classificatore e del training;
 - `theory.md`: spiegazione teorica di Xavier initialization, loss, cross-entropy, pooling, cache, layer normalization, `gamma` e `beta`;
-- `datasets/train_data.txt`: esempi usati dalla modalità `train`;
-- `datasets/test_data.txt`: esempi usati dalla modalità `predict`;
-- `last_training_set.txt`: dataset Morph-it! completo per il training;
-- `last_validation_set.txt`: dataset Morph-it! per validation loss ed early stopping;
-- `last_test_set.txt`: dataset Morph-it! per la valutazione finale;
-- `transformer_model.txt`: miglior modello salvato da `train` e caricato da `predict`, con metadati della validation loss;
-- `transformer_model_latest.txt`: pesi dell'ultima epoca completata, usati da `train --resume`;
+- `datasets/training_set.txt`: dataset Morph-it! completo per il training;
+- `datasets/validation_set.txt`: dataset Morph-it! per validation loss ed early stopping;
+- `datasets/test_set.txt`: dataset Morph-it! per la valutazione finale;
+- per gli smoke test si usa `--limit` sui dataset principali, senza creare dataset aggiuntivi;
+- `models/transformer_model.txt`: miglior modello salvato da `train` e caricato da `predict`, con metadati della validation loss;
+- `models/transformer_model_latest.txt`: pesi dell'ultima epoca completata, usati da `train --resume`;
 - `transformer_encoder.exe`: eseguibile generato dalla compilazione, se si usa il comando mostrato sopra.
 
 ## Limiti dell'esempio

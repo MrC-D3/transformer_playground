@@ -688,7 +688,9 @@ struct ModelMetadata {
     bool hasValidationLoss = false;
 };
 
-bool loadDatasetFile(const std::string& path, std::vector<Sample>& dataset) {
+bool loadDatasetFile(const std::string& path,
+                     std::vector<Sample>& dataset,
+                     std::size_t maximumSamples = 0) {
     std::ifstream input(path);
     if (!input) {
         return false;
@@ -699,8 +701,11 @@ bool loadDatasetFile(const std::string& path, std::vector<Sample>& dataset) {
         return false;
     }
 
-    dataset.reserve(dataset.size() + sampleCount);
-    for (std::size_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+    const std::size_t samplesToRead = maximumSamples == 0
+        ? sampleCount
+        : std::min(sampleCount, maximumSamples);
+    dataset.reserve(dataset.size() + samplesToRead);
+    for (std::size_t sampleIndex = 0; sampleIndex < samplesToRead; ++sampleIndex) {
         std::size_t label = 0;
         std::string word;
         if (!(input >> label >> word) || word.empty() || label > 1) {
@@ -813,10 +818,10 @@ void printUsage(const char* programName) {
     std::cout << "Uso:\n"
               << "  " << programName
               << " train [dataset1 dataset2 ...] [--validation file]\n"
-              << "        [--epochs N] [--patience N] [--loss-threshold X] [--resume]\n"
+              << "        [--epochs N] [--patience N] [--loss-threshold X] [--limit N] [--resume]\n"
               << "                                                    Addestra e salva il modello\n"
               << "  " << programName
-              << " predict [dataset]                Carica il modello e classifica il dataset\n";
+              << " predict [dataset] [--limit N]     Carica il modello e classifica il dataset\n";
 }
 
 bool parsePositiveSize(const std::string& text, std::size_t& value) {
@@ -856,8 +861,8 @@ int main(int argc, char* argv[]) {
     }
 
     const std::string mode = argv[1];
-    const std::string bestModelPath = "transformer_model.txt";
-    const std::string latestModelPath = "transformer_model_latest.txt";
+    const std::string bestModelPath = "models/transformer_model.txt";
+    const std::string latestModelPath = "models/transformer_model_latest.txt";
     const std::size_t defaultEpochs = 1000;
     std::size_t epochs = defaultEpochs;
     const std::size_t defaultPatience = 5;
@@ -865,6 +870,7 @@ int main(int argc, char* argv[]) {
     double lossThreshold = 0.0;
     bool hasLossThreshold = false;
     bool resume = false;
+    std::size_t datasetLimit = 0;
     std::vector<std::string> datasetPaths;
     std::vector<std::string> validationPaths;
 
@@ -903,6 +909,13 @@ int main(int argc, char* argv[]) {
                 ++argument;
             } else if (currentArgument == "--resume") {
                 resume = true;
+            } else if (currentArgument == "--limit") {
+                if (argument + 1 >= argc ||
+                    !parsePositiveSize(argv[argument + 1], datasetLimit)) {
+                    std::cerr << "Errore: --limit richiede un intero positivo.\n";
+                    return 1;
+                }
+                ++argument;
             } else {
                 if (currentArgument.rfind("--", 0) == 0) {
                     std::cerr << "Errore: opzione non riconosciuta: "
@@ -913,27 +926,38 @@ int main(int argc, char* argv[]) {
             }
         }
         if (datasetPaths.empty()) {
-            datasetPaths.push_back("datasets/train_data.txt");
+            datasetPaths.push_back("datasets/training_set.txt");
         }
     } else {
         if (resume) {
             std::cerr << "Errore: --resume è disponibile solo con train.\n";
             return 1;
         }
-        if (argc == 2) {
-            datasetPaths.push_back("datasets/test_data.txt");
-        } else if (argc == 3 && std::string(argv[2]).rfind("--", 0) != 0) {
-            datasetPaths.push_back(argv[2]);
-        } else {
-            printUsage(argv[0]);
-            return 1;
+        for (int argument = 2; argument < argc; ++argument) {
+            const std::string currentArgument = argv[argument];
+            if (currentArgument == "--limit") {
+                if (argument + 1 >= argc ||
+                    !parsePositiveSize(argv[argument + 1], datasetLimit)) {
+                    std::cerr << "Errore: --limit richiede un intero positivo.\n";
+                    return 1;
+                }
+                ++argument;
+            } else if (currentArgument.rfind("--", 0) == 0 || !datasetPaths.empty()) {
+                printUsage(argv[0]);
+                return 1;
+            } else {
+                datasetPaths.push_back(currentArgument);
+            }
+        }
+        if (datasetPaths.empty()) {
+            datasetPaths.push_back("datasets/test_set.txt");
         }
     }
 
     std::vector<Sample> dataset;
     for (const std::string& datasetPath : datasetPaths) {
         std::vector<Sample> fileDataset;
-        if (!loadDatasetFile(datasetPath, fileDataset)) {
+        if (!loadDatasetFile(datasetPath, fileDataset, datasetLimit)) {
             std::cerr << "Errore: impossibile leggere " << datasetPath
                       << ". Controllare il formato del dataset.\n";
             return 1;
@@ -944,7 +968,7 @@ int main(int argc, char* argv[]) {
     std::vector<Sample> validationDataset;
     for (const std::string& validationPath : validationPaths) {
         std::vector<Sample> fileDataset;
-        if (!loadDatasetFile(validationPath, fileDataset)) {
+        if (!loadDatasetFile(validationPath, fileDataset, datasetLimit)) {
             std::cerr << "Errore: impossibile leggere il dataset di validation "
                       << validationPath << ". Controllare il formato del dataset.\n";
             return 1;
@@ -961,6 +985,11 @@ int main(int argc, char* argv[]) {
     Encoder encoder(embeddingSize, feedForwardSize);
     LinearClassifier classifier(embeddingSize, 2);
     ModelMetadata latestMetadata;
+
+    std::cout << "Esempi di training caricati: " << dataset.size() << '\n';
+    if (!validationDataset.empty()) {
+        std::cout << "Esempi di validation caricati: " << validationDataset.size() << '\n';
+    }
 
     if (resume && !loadModel(
             latestModelPath, embedding, encoder, classifier, latestMetadata)) {
